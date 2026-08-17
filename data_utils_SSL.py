@@ -1,173 +1,156 @@
+"""
+data_utils_SSL.py — adapted for MSS-Urdu dataset
+Protocol format: SPEAKER_ID  UTT_ID  -  SYSTEM_ID  bonafide/spoof
+                 col[0]      col[1]       col[3]    col[4]
+"""
+
 import os
 import numpy as np
 import torch
-import torch.nn as nn
 from torch import Tensor
-import librosa
 from torch.utils.data import Dataset
-from RawBoost import ISD_additive_noise,LnL_convolutive_noise,SSI_additive_noise,normWav
-from random import randrange
-import random
+import soundfile as sf
+from RawBoost import (ISD_additive_noise, LnL_convolutive_noise,
+                      SSI_additive_noise, normWav)
+
+SAMPLE_RATE = 16_000
+TRIM_LENGTH  = 64_600
 
 
-___author__ = "Hemlata Tak"
-__email__ = "tak@eurecom.fr"
+def pad_or_trim(x, length=TRIM_LENGTH):
+    if len(x) >= length:
+        return x[:length]
+    return np.tile(x, (length // len(x)) + 1)[:length]
 
 
-def genSpoof_list( dir_meta,is_train=False,is_eval=False):
-    
-    d_meta = {}
-    file_list=[]
-    with open(dir_meta, 'r') as f:
-         l_meta = f.readlines()
+def load_audio(path):
+    x, sr = sf.read(path)
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    return x.astype(np.float32)
 
-    if (is_train):
-        for line in l_meta:
-             _,key,_,_,label = line.strip().split()
-             
-             file_list.append(key)
-             d_meta[key] = 1 if label == 'bonafide' else 0
-        return d_meta,file_list
-    
-    elif(is_eval):
-        for line in l_meta:
-            key= line.strip()
-            file_list.append(key)
+
+def _find_audio(base_dir, utt_id):
+    for ext in ('.flac', '.wav'):
+        p = os.path.join(base_dir, utt_id + ext)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"Audio not found: {utt_id} in {base_dir}")
+
+
+def _parse_line(line):
+    # SPEAKER_ID  UTT_ID  -  SYSTEM_ID  bonafide/spoof
+    parts = line.strip().split()
+    if len(parts) < 5:
+        return None, None
+    utt_id = parts[1]
+    label  = 1 if parts[4].lower() == 'bonafide' else 0
+    return utt_id, label
+
+
+def genSpoof_list(dir_meta, is_train, is_eval):
+    label_dict, file_list = {}, []
+    with open(dir_meta) as f:
+        for line in f:
+            utt_id, label = _parse_line(line)
+            if utt_id is None:
+                continue
+            file_list.append(utt_id)
+            label_dict[utt_id] = label
+    if is_eval:
         return file_list
-    else:
-        for line in l_meta:
-             _,key,_,_,label = line.strip().split()
-             
-             file_list.append(key)
-             d_meta[key] = 1 if label == 'bonafide' else 0
-        return d_meta,file_list
+    return label_dict, file_list
 
-
-
-def pad(x, max_len=64600):
-    x_len = x.shape[0]
-    if x_len >= max_len:
-        return x[:max_len]
-    # need to pad
-    num_repeats = int(max_len / x_len)+1
-    padded_x = np.tile(x, (1, num_repeats))[:, :max_len][0]
-    return padded_x	
-			
 
 class Dataset_ASVspoof2019_train(Dataset):
-	def __init__(self,args,list_IDs, labels, base_dir,algo):
-            '''self.list_IDs	: list of strings (each string: utt key),
-               self.labels      : dictionary (key: utt key, value: label integer)'''
-               
-            self.list_IDs = list_IDs
-            self.labels = labels
-            self.base_dir = base_dir
-            self.algo=algo
-            self.args=args
-            self.cut=64600 # take ~4 sec audio (64600 samples)
+    def __init__(self, args, list_IDs, labels, base_dir, algo):
+        self.list_IDs = list_IDs
+        self.labels   = labels
+        self.base_dir = base_dir
+        self.algo     = algo
+        self.args     = args
+        self.cut      = TRIM_LENGTH
+        self.sr       = SAMPLE_RATE
 
-	def __len__(self):
-           return len(self.list_IDs)
+    def __len__(self):
+        return len(self.list_IDs)
+
+    def __getitem__(self, index):
+        utt_id = self.list_IDs[index]
+        label  = self.labels[utt_id]
+        x = load_audio(_find_audio(self.base_dir, utt_id))
+        x = pad_or_trim(x, self.cut)
+        x = process_Rawboost_feature(x, self.sr, self.args, self.algo)
+        return Tensor(x), label
 
 
-	def __getitem__(self, index):
-            
-            utt_id = self.list_IDs[index]
-            X,fs = librosa.load(self.base_dir+'flac/'+utt_id+'.flac', sr=16000) 
-            Y=process_Rawboost_feature(X,fs,self.args,self.algo)
-            X_pad= pad(Y,self.cut)
-            x_inp= Tensor(X_pad)
-            target = self.labels[utt_id]
-            
-            return x_inp, target
-            
-            
 class Dataset_ASVspoof2021_eval(Dataset):
-	def __init__(self, list_IDs, base_dir):
-            '''self.list_IDs	: list of strings (each string: utt key),
-               '''
-               
-            self.list_IDs = list_IDs
-            self.base_dir = base_dir
-            self.cut=64600 # take ~4 sec audio (64600 samples)
+    def __init__(self, list_IDs, base_dir):
+        self.list_IDs = list_IDs
+        self.base_dir = base_dir
+        self.cut      = TRIM_LENGTH
 
-	def __len__(self):
-            return len(self.list_IDs)
+    def __len__(self):
+        return len(self.list_IDs)
 
-
-	def __getitem__(self, index):
-            
-            utt_id = self.list_IDs[index]
-            X, fs = librosa.load(self.base_dir+'flac/'+utt_id+'.flac', sr=16000)
-            X_pad = pad(X,self.cut)
-            x_inp = Tensor(X_pad)
-            return x_inp,utt_id  
+    def __getitem__(self, index):
+        utt_id = self.list_IDs[index]
+        x = load_audio(_find_audio(self.base_dir, utt_id))
+        x = pad_or_trim(x, self.cut)
+        return Tensor(x), utt_id
 
 
-
-
-#--------------RawBoost data augmentation algorithms---------------------------##
-
-def process_Rawboost_feature(feature, sr,args,algo):
-    
-    # Data process by Convolutive noise (1st algo)
-    if algo==1:
-
-        feature =LnL_convolutive_noise(feature,args.N_f,args.nBands,args.minF,args.maxF,args.minBW,args.maxBW,args.minCoeff,args.maxCoeff,args.minG,args.maxG,args.minBiasLinNonLin,args.maxBiasLinNonLin,sr)
-                            
-    # Data process by Impulsive noise (2nd algo)
-    elif algo==2:
-        
-        feature=ISD_additive_noise(feature, args.P, args.g_sd)
-                            
-    # Data process by coloured additive noise (3rd algo)
-    elif algo==3:
-        
-        feature=SSI_additive_noise(feature,args.SNRmin,args.SNRmax,args.nBands,args.minF,args.maxF,args.minBW,args.maxBW,args.minCoeff,args.maxCoeff,args.minG,args.maxG,sr)
-    
-    # Data process by all 3 algo. together in series (1+2+3)
-    elif algo==4:
-        
-        feature =LnL_convolutive_noise(feature,args.N_f,args.nBands,args.minF,args.maxF,args.minBW,args.maxBW,
-                 args.minCoeff,args.maxCoeff,args.minG,args.maxG,args.minBiasLinNonLin,args.maxBiasLinNonLin,sr)                         
-        feature=ISD_additive_noise(feature, args.P, args.g_sd)  
-        feature=SSI_additive_noise(feature,args.SNRmin,args.SNRmax,args.nBands,args.minF,
-                args.maxF,args.minBW,args.maxBW,args.minCoeff,args.maxCoeff,args.minG,args.maxG,sr)                 
-
-    # Data process by 1st two algo. together in series (1+2)
-    elif algo==5:
-        
-        feature =LnL_convolutive_noise(feature,args.N_f,args.nBands,args.minF,args.maxF,args.minBW,args.maxBW,
-                 args.minCoeff,args.maxCoeff,args.minG,args.maxG,args.minBiasLinNonLin,args.maxBiasLinNonLin,sr)                         
-        feature=ISD_additive_noise(feature, args.P, args.g_sd)                
-                            
-
-    # Data process by 1st and 3rd algo. together in series (1+3)
-    elif algo==6:  
-        
-        feature =LnL_convolutive_noise(feature,args.N_f,args.nBands,args.minF,args.maxF,args.minBW,args.maxBW,
-                 args.minCoeff,args.maxCoeff,args.minG,args.maxG,args.minBiasLinNonLin,args.maxBiasLinNonLin,sr)                         
-        feature=SSI_additive_noise(feature,args.SNRmin,args.SNRmax,args.nBands,args.minF,args.maxF,args.minBW,args.maxBW,args.minCoeff,args.maxCoeff,args.minG,args.maxG,sr) 
-
-    # Data process by 2nd and 3rd algo. together in series (2+3)
-    elif algo==7: 
-        
-        feature=ISD_additive_noise(feature, args.P, args.g_sd)
-        feature=SSI_additive_noise(feature,args.SNRmin,args.SNRmax,args.nBands,args.minF,args.maxF,args.minBW,args.maxBW,args.minCoeff,args.maxCoeff,args.minG,args.maxG,sr) 
-   
-    # Data process by 1st two algo. together in Parallel (1||2)
-    elif algo==8:
-        
-        feature1 =LnL_convolutive_noise(feature,args.N_f,args.nBands,args.minF,args.maxF,args.minBW,args.maxBW,
-                 args.minCoeff,args.maxCoeff,args.minG,args.maxG,args.minBiasLinNonLin,args.maxBiasLinNonLin,sr)                         
-        feature2=ISD_additive_noise(feature, args.P, args.g_sd)
-
-        feature_para=feature1+feature2
-        feature=normWav(feature_para,0)  #normalized resultant waveform
- 
-    # original data without Rawboost processing           
+def process_Rawboost_feature(feature, sr, args, algo):
+    if algo == 0:
+        return feature
+    elif algo == 1:
+        return LnL_convolutive_noise(feature, args.N_f, args.nBands,
+            args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG,
+            args.minBiasLinNonLin, args.maxBiasLinNonLin, sr)
+    elif algo == 2:
+        return ISD_additive_noise(feature, args.P, args.g_sd)
+    elif algo == 3:
+        return SSI_additive_noise(feature, args.SNRmin, args.SNRmax,
+            args.nBands, args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG, sr)
+    elif algo == 4:
+        feature = LnL_convolutive_noise(feature, args.N_f, args.nBands,
+            args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG,
+            args.minBiasLinNonLin, args.maxBiasLinNonLin, sr)
+        feature = ISD_additive_noise(feature, args.P, args.g_sd)
+        return SSI_additive_noise(feature, args.SNRmin, args.SNRmax,
+            args.nBands, args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG, sr)
+    elif algo == 5:
+        feature = LnL_convolutive_noise(feature, args.N_f, args.nBands,
+            args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG,
+            args.minBiasLinNonLin, args.maxBiasLinNonLin, sr)
+        feature = ISD_additive_noise(feature, args.P, args.g_sd)
+        return normWav(feature, 0)
+    elif algo == 6:
+        feature = LnL_convolutive_noise(feature, args.N_f, args.nBands,
+            args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG,
+            args.minBiasLinNonLin, args.maxBiasLinNonLin, sr)
+        feature = SSI_additive_noise(feature, args.SNRmin, args.SNRmax,
+            args.nBands, args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG, sr)
+        return normWav(feature, 0)
+    elif algo == 7:
+        feature = ISD_additive_noise(feature, args.P, args.g_sd)
+        feature = SSI_additive_noise(feature, args.SNRmin, args.SNRmax,
+            args.nBands, args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG, sr)
+        return normWav(feature, 0)
+    elif algo == 8:
+        f1 = LnL_convolutive_noise(feature, args.N_f, args.nBands,
+            args.minF, args.maxF, args.minBW, args.maxBW,
+            args.minCoeff, args.maxCoeff, args.minG, args.maxG,
+            args.minBiasLinNonLin, args.maxBiasLinNonLin, sr)
+        f2 = ISD_additive_noise(feature, args.P, args.g_sd)
+        return normWav((f1 + f2) / 2, 0)
     else:
-        
-        feature=feature
-    
-    return feature
+        raise ValueError(f"Unknown algo: {algo}")
